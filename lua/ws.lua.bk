@@ -1,0 +1,417 @@
+-- Copyright (C) 2019-2020 chenwj
+-- Intro: websockt for chat, message from redis sub
+-- Date: 2019/08/14
+
+require "resty.core"
+local redis = require "redis"
+local server = require "resty.websocket.server"
+local cjson_safe = require "cjson.safe"
+local http = require "resty.http"
+
+local sema_module = require "sema_module"
+local stats_module = require "stats_module"
+local peers_module = require "peers_module"
+local peers_sema_module = require "peers_sema_module"
+local config = require "config"
+
+local log = require "log"
+
+local kill = ngx.thread.kill
+
+-- 信号量
+local worker_id = ngx.worker.id()
+-- 获取消息id
+local cache = ngx.shared.cache
+local p2pcache = ngx.shared.p2pcache
+local recv_thread = nil
+local g_session_id = nil
+local g_user_id = nil
+
+-- 协程控制
+local t = {}
+local t_closed = {}
+
+
+local wb, err = server:new {
+    timeout = 5000,
+    max_payload_len = 65535
+}
+
+if not wb then
+    log.err("web_err", err)
+    return
+end
+
+local arg = ngx.req.get_uri_args()
+
+local token = arg["token"]
+
+if token == nil then
+    log.err("web_err", "token is nil.")
+    wb:send_close(4001, "token is nil.")
+    return
+end
+
+-- 验证是否可以登录
+local function login_check(token)
+    local url = config.get_login_check_url()
+    local req_url = string.format("%s%s",url,token)
+    local httpc = http.new()
+    local res, err = httpc:request_uri(req_url,
+        {
+            method = "GET",
+            -- args = { feature_base64 = feature },
+            -- body = ngx.encode_args({ token = token })
+        }
+    )
+
+    -- TODO:这里服务器断点，会崩溃
+    local ok = true
+    local result = nil
+
+    if res == nil  then
+      ok = false
+    else
+        if res.status ~= 200 then
+             log.err("web_err", "http server connected failed.")
+             wb:send_close(4006, "http server connected failed.")
+             ok = false
+         end
+    end
+
+    if ok then
+        log.debug("http_get", res.body)
+        result = cjson_safe.decode(res.body)
+    end
+
+    httpc:close()
+
+    return ok, result
+end
+
+
+local inc_key = string.format("%s_%d", test_room_id, worker_id)
+local last_inc_num = cache:get(inc_key)
+
+local function send_by_key(room_id, key)
+    local v = cache:get(key)
+    if v == nil then
+        log.err("room_id", room_id, "user_id", g_user_id, "sesson_id", g_session_id, 
+            "acction", "room_msg", "err", "get memory failed")
+        return "error"
+    end
+
+    -- 判断是否是解散群事件
+    local msg = cjson_safe.decode(v)
+    local inner_typ = msg["typ"] 
+    local base64_txt = msg["message"]
+
+    -- keysend msg, 变成base64发送数据
+    local send_txt = ngx.decode_base64(base64_txt)
+    local bytes, err = wb:send_text(send_txt)
+
+    if not bytes then
+        log.err("room_id", room_id, "user_id", g_user_id, "sesson_id", g_session_id, 
+            "acction", "room_msg", "err", err)
+    else
+        log.info("room_id", room_id, "user_id", g_user_id, "sesson_id", g_session_id, "acction", "room_msg", "err", "ok")
+    end
+
+    return inner_typ
+end
+
+local function send_msg(room_id, last_inc_num, last_inc_now)
+    local n = last_inc_now - last_inc_num
+    if n > 0 then
+        for i=1, n do
+            -- msg_id = room_name + work_id + msg_inc_num
+            local key = string.format("%s_%d_%d",room_id, worker_id, last_inc_num + i)
+            local result = send_by_key(room_id, key) 
+
+            -- 如果是解散群事件 立即返回
+            if result == "disband" then
+                return "disband"
+            end
+        end
+    end
+
+    return "ok"
+end
+
+--等待一个消息的到来
+local function wait_msg(room_id)
+    local inc_key = string.format("%s_%d", room_id, worker_id)
+    local last_inc_num = cache:get(inc_key) 
+
+    if last_inc_num == nil then
+        last_inc_num = 0
+    end
+
+    while true do
+        ::redo::
+        local ok, err = sema_module.wait(room_id, 2)
+
+        -- 群退出
+        if t_closed[room_id] == true then
+            log.info("room_id", room_id, "user_id", g_user_id, "sesson_id", g_session_id, 
+            "acction", "room_out_msg", "err", "ok")
+            break
+        end
+
+        local inc_key = string.format("%s_%d", room_id, worker_id)
+        local last_inc_now = cache:get(inc_key)
+        if last_inc_now == nil then
+            last_inc_now = 0
+        end
+
+        if last_inc_num ~= 0 and last_inc_num >= last_inc_now then
+            -- ngx.log(ngx.INFO, "---- redo ---", room_id)
+            goto redo
+        end
+
+        -- 判断是否是解散群事件
+        -- if ok then
+        local result = send_msg(room_id, last_inc_num, last_inc_now)
+        last_inc_num = last_inc_now
+
+        -- 如果是解散群事件 立即返回
+        if result == "disband" then
+            log.info("room_id", room_id, "user_id", g_user_id, "sesson_id", g_session_id, 
+            "acction", "room_disband_msg", "err", "ok")
+            break
+        end
+
+        -- log.info("room_id", room_id, "user_id", g_user_id, "sesson_id", g_session_id, "acction", "room_msg", "err", "ok")
+
+        -- end
+        ngx.sleep(0.001)
+   end
+
+   -- local log_str = string.format("房间线程退出 room_out_msg:%s, result:out disband_msg:", room_id, room_id)
+   -- ngx.log(ngx.INFO, log_str)
+
+   t_closed[room_id] = false
+   t[room_id] = nil
+   stats_module.people_out(room_id)
+end
+
+local function find_room(room_id)
+    local is_found = false
+    for k, v in pairs(t) do
+        if  k == room_id and v ~= nil then
+            is_found = true
+            break
+        end
+    end
+
+    return is_found
+end
+
+-- 处理添加/移除群通道名 也就是添加或者移除房间
+local function process_room_msg(room_id, typ)
+    if typ == "in" or typ == "new" then
+        t_closed[room_id] = false
+        local is_found  = find_room(room_id)
+        log.info("room_id", room_id, "user_id", g_user_id, "sesson_id", g_session_id, 
+            "acction", "room_innew_msg", "err", "ok")
+
+        if is_found == false then
+            -- 监听新消息
+            sema_module.create(room_id)
+            stats_module.people_in(room_id)
+            t[room_id] = ngx.thread.spawn(wait_msg, room_id)
+        end
+    end
+
+    if typ == "out" then
+        t_closed[room_id] = true
+        
+        local is_found  = find_room(room_id)
+        if is_found == true then
+             stats_module.people_out(room_id)
+             local thread_del = t[room_id]
+             kill(thread_del)
+             t[room_id] = nil
+        end
+
+    end
+end
+
+-- 获取点对点信息
+local function p2p_msg(user_id)
+    local session = peers_module.new_peer(user_id)
+    if session == nil then
+        log.err("user_id", g_user_id, "sesson_id", g_session_id, "acction", "p2p_msg", "err", "session is nil.")
+        return
+    end
+
+    g_user_id = user_id
+    g_session_id = session
+
+     while true do
+        local ok, err = peers_sema_module.wait(session, 60)
+        if ok then
+            
+            local n = p2pcache:llen(session)
+
+            for i=1, n do
+                local txt = p2pcache:lpop(session)
+                if txt ~= nil then
+                    local msg = cjson_safe.decode(txt)
+                    local inner_typ = msg["typ"] 
+
+                    -- 消息转发
+                    if inner_typ == "p2pmsg" then
+                        local send_txt = ngx.decode_base64(msg["message"])
+                        local bytes, err = wb:send_text(send_txt)
+                        log.info("user_id", g_user_id, "sesson_id", g_session_id, "acction", "p2p_msg", "err", "ok")
+                    end
+
+                    -- 添加聊天室监听
+                    -- 去除聊天室监听
+                    -- 创建聊天室
+                    if inner_typ == "in" or inner_typ == "out" or inner_typ == "new" then
+                        local room_id = msg["message"]
+
+                        if room_id ~= nil then
+                            process_room_msg(room_id, inner_typ)
+                        end
+                    end
+                end
+                ngx.sleep(0.001)
+            end -- for
+
+            ngx.sleep(0.001)
+        end
+   end
+end
+
+
+-- socket 接收数据，主要是监听断开事件
+local function msg_loop()
+    while true do
+        -- ngx.log(ngx.ERR, "waitting ...")
+        local data, typ, err = wb:recv_frame()
+
+        if wb.fatal then
+            -- ngx.log(ngx.ERR, "failed to receive frame:", err)
+            break
+        end
+
+        if not data then
+            local bytes, err = wb:send_ping()
+            if not bytes then
+                -- ngx.log(ngx.ERR, "failed to send ping:", err)
+                break
+            end
+        elseif typ == "ping" then
+            local bytes, err = wb:send_pong()
+            if not bytes then
+                -- ngx.log(ngx.ERR, "failed to send pong:", err)
+                break
+            end
+        elseif typ == "pong" then
+            -- ngx.log(ngx.ERR, "client ponged")
+        elseif typ == "text" then
+            -- ngx.log(ngx.INFO, "recv from clinet msg:", data)
+        elseif typ == "close" then
+            -- ngx.log(ngx.INFO, "recv from close")
+            bytes, err = wb:send_close()
+            break
+        else
+            break
+        end
+
+        ngx.sleep(0.01)
+        -- ngx.sleep(0.5)
+    end
+end
+
+--- 登录检测
+local ok, result = login_check(token)
+local uid = nil
+local num = 0
+
+local is_ok = false
+
+-- 事件循环
+if ok and  result["error"] == "" then
+    local user_id = result["uid"]
+    local cids  = result["cids"]
+    local cids_num = result["cids_num"]
+
+    -- uid不能为空
+    if user_id == nil then
+        wb:send_close(4008, "user info get error!")
+        return
+    end
+
+    -- 同一账号登录不能超过3
+    local has_conn_num = peers_module.has_conns(user_id)
+    if has_conn_num > 3 then
+         wb:send_close(4002, "user login count is > 3")
+         log.info("token", token, "session", g_session_id, "user_id", g_user_id, "action", "login", "err", "user login count is > 3")
+        return
+    end
+
+    local i = 1
+    for k, room_id in pairs(cids) do
+        sema_module.create(room_id)
+        stats_module.people_in(room_id)
+        t_closed[room_id] = false
+        t[room_id] = ngx.thread.spawn(wait_msg, room_id)
+        i = i+1
+    end
+
+    -- 添加点对点事件
+    t[user_id] = ngx.thread.spawn(p2p_msg, user_id)
+    t_closed[user_id] = false
+    num = i
+
+    is_ok = true
+
+    -- log.info("user_login", user_id, "result", "sussessul", "token", token)
+    log.info("token", token, "session", g_session_id, "user_id", g_user_id, "action", "login")
+
+    -- 循环
+    msg_loop()
+else
+    wb:send_close(4008, result["error"])
+    return
+end
+
+-- 事件退出
+if is_ok then
+    -- ws关闭
+    for k, v in pairs(t) do
+        if v ~= nil then
+            kill(v)
+        end
+    end
+
+    local cids  = result["cids"]
+    for k, room_id in pairs(cids) do
+        -- ngx.log(ngx.INFO, "i=",k,  " out:", room_id)
+        stats_module.people_out(room_id)
+    end
+end
+
+-- 人数减少
+if g_session_id ~= nil and g_user_id ~= nil then
+    peers_module.remove_peer(g_user_id, g_session_id)
+    log.info("token", token, "session", g_session_id, "user_id", g_user_id, "action", "logout")
+end
+
+ngx.exit(0)
+
+
+--[[
+    // 4100 token验证错误
+    // 4101 token失效
+    // 4102 同一账号登录太多次
+
+    // 
+]]
+
+
+
